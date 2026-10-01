@@ -17,7 +17,7 @@ The APK is built by GitHub Actions (it needs Google's Android SDK, Go and Node):
 2. Open **Actions → Android APK → Run workflow** (it also runs on every push).
 3. Download **piik-android-apk** from the run, copy it to your phone, and open it to install (allow "install unknown apps" for your file manager or browser).
 
-Tag a commit `v0.1.0` and the APK is also attached to a GitHub Release.
+Every build on `main` is also published under **Releases** with the APK attached, so you can download it straight from your phone.
 
 **Updates:** CI signs with a throwaway debug key unless you add a keystore, and Android refuses to update an app signed with a different key. For installable updates, add the repository secrets `PIIK_KEYSTORE_BASE64` (base64 of a `.jks`), `PIIK_KEYSTORE_PASSWORD`, `PIIK_KEY_ALIAS` and `PIIK_KEY_PASSWORD`.
 
