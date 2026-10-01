@@ -131,6 +131,23 @@ class WebActivity : Activity() {
         }
     }
 
+    /**
+     * Host mode: let Piik's page reach the engine on this phone. WebView hides
+     * local addresses behind ".local" names in WebRTC; assets/icefix.js swaps
+     * them for 127.0.0.1 and the phone's own addresses (idempotent).
+     */
+    private fun injectIceFix(view: WebView, url: String?) {
+        val host = url?.let { Uri.parse(it).host } ?: return
+        if (mode != MODE_HOST || (host != "127.0.0.1" && host != "localhost")) return
+        val addresses = listOf("127.0.0.1") +
+            NetInfo.lanAddresses(this).split(",").mapNotNull { it.substringBefore("/").takeIf(String::isNotBlank) }
+        val json = addresses.distinct().joinToString(",", "[", "]") { "\"$it\"" }
+        val script = iceFixSource ?: assets.open("icefix.js").bufferedReader().use { it.readText() }.also { iceFixSource = it }
+        view.evaluateJavascript(script.replace("__PIIK_ADDRESSES__", json), null)
+    }
+
+    private var iceFixSource: String? = null
+
     // ---- WebView clients ----
 
     private inner class Client : WebViewClient() {
@@ -145,7 +162,12 @@ class WebActivity : Activity() {
             }
         }
 
+        override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+            injectIceFix(view, url)
+        }
+
         override fun onPageFinished(view: WebView, url: String?) {
+            injectIceFix(view, url)
             view.evaluateJavascript(POLYFILLS, null)
             // Piik's host page talks to the engine on this phone over WebRTC.
             // WebView hides local addresses behind mDNS names unless the page
