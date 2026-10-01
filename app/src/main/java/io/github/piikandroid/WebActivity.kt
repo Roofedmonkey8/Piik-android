@@ -1,0 +1,389 @@
+package io.github.piikandroid
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.PictureInPictureParams
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.util.Rational
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import android.view.WindowManager
+import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import android.widget.Toast
+
+/**
+ * Shows Piik's own web interface: an invite link to watch, or (host mode) the
+ * pages served by the Piik engine running on this phone.
+ */
+class WebActivity : Activity() {
+    private lateinit var root: FrameLayout
+    private lateinit var web: WebView
+    private var mode = MODE_WATCH
+    private var customView: View? = null
+    private var customCallback: WebChromeClient.CustomViewCallback? = null
+    private var pendingPermission: PermissionRequest? = null
+    private var videoPlaying = false
+    private var videoAspect = Rational(16, 9)
+
+    private val hostListener: () -> Unit = { onHostState() }
+    private val externalListener: (String) -> Unit = { url -> openExternal(url) }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        web = WebView(this)
+        root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        setContentView(root)
+        web.setBackgroundColor(Color.BLACK)
+
+        web.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            setSupportMultipleWindows(false)
+            loadWithOverviewMode = true
+            useWideViewPort = true
+            userAgentString = "$userAgentString PiikAndroid/${packageManager.getPackageInfo(packageName, 0).versionName}"
+        }
+        web.addJavascriptInterface(Bridge(), "PiikAndroid")
+        web.webViewClient = Client()
+        web.webChromeClient = Chrome()
+        handle(intent, savedInstanceState)
+    }
+
+    private fun handle(intent: Intent, saved: Bundle? = null) {
+        mode = intent.getStringExtra(EXTRA_MODE) ?: if (intent.action == Intent.ACTION_VIEW) MODE_WATCH else mode
+        val url = intent.getStringExtra(EXTRA_URL) ?: intent.data?.toString()
+        if (mode == MODE_HOST) {
+            HostState.addListener(hostListener)
+            HostState.addExternalListener(externalListener)
+            if (saved != null) web.restoreState(saved) else HostState.pageUrl?.let { lastHostPage = it; web.loadUrl(it) }
+            if (HostState.pageUrl == null) onHostState()
+        } else {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (saved != null) web.restoreState(saved) else if (url != null) web.loadUrl(url)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val url = intent.getStringExtra(EXTRA_URL) ?: intent.data?.toString()
+        val newMode = intent.getStringExtra(EXTRA_MODE) ?: MODE_WATCH
+        if (newMode == MODE_HOST) {
+            mode = MODE_HOST
+            HostState.addListener(hostListener)
+            HostState.addExternalListener(externalListener)
+            HostState.pageUrl?.let { if (web.url != it) web.loadUrl(it) }
+        } else if (url != null) {
+            mode = MODE_WATCH
+            web.loadUrl(url)
+        }
+    }
+
+    private var lastHostPage: String? = null
+
+    private fun onHostState() {
+        when (HostState.phase) {
+            HostState.Phase.RUNNING -> HostState.pageUrl?.let { page ->
+                if (page != lastHostPage) {
+                    lastHostPage = page
+                    web.loadUrl(page)
+                }
+            }
+            HostState.Phase.STARTING -> if (web.url == null) web.loadData(statusPage("Starting Piik…"), "text/html", "utf-8")
+            HostState.Phase.FAILED -> web.loadData(statusPage(HostState.message ?: "Piik stopped."), "text/html", "utf-8")
+            HostState.Phase.STOPPED -> if (mode == MODE_HOST) finish()
+        }
+    }
+
+    private fun statusPage(text: String): String {
+        val safe = text.replace("&", "&amp;").replace("<", "&lt;")
+        return "<html><body style='background:#0b0c10;color:#e9ecf5;font-family:sans-serif;padding:24px;white-space:pre-wrap'>$safe</body></html>"
+    }
+
+    private fun openExternal(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Exception) {
+        }
+    }
+
+    // ---- WebView clients ----
+
+    private inner class Client : WebViewClient() {
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            val uri = request.url
+            return when (uri.scheme) {
+                "http", "https" -> false
+                else -> {
+                    openExternal(uri.toString())
+                    true
+                }
+            }
+        }
+
+        override fun onPageFinished(view: WebView, url: String?) {
+            view.evaluateJavascript(POLYFILLS, null)
+            // Piik's host page talks to the engine on this phone over WebRTC.
+            // WebView hides local addresses behind mDNS names unless the page
+            // has microphone access, and those names can't be resolved without
+            // multicast (never on mobile data). Briefly opening the mic lifts
+            // the hiding; the track is stopped immediately.
+            val host = url?.let { Uri.parse(it).host }
+            if (mode == MODE_HOST && (host == "127.0.0.1" || host == "localhost") &&
+                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            ) {
+                view.evaluateJavascript(UNLOCK_LOCAL_ADDRESSES, null)
+            }
+        }
+    }
+
+    private inner class Chrome : WebChromeClient() {
+        override fun onPermissionRequest(request: PermissionRequest) {
+            runOnUiThread {
+                val needed = ArrayList<String>()
+                for (r in request.resources) {
+                    when (r) {
+                        PermissionRequest.RESOURCE_AUDIO_CAPTURE -> needed += Manifest.permission.RECORD_AUDIO
+                        PermissionRequest.RESOURCE_VIDEO_CAPTURE -> needed += Manifest.permission.CAMERA
+                    }
+                }
+                val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                if (missing.isEmpty()) {
+                    request.grant(request.resources)
+                } else {
+                    pendingPermission = request
+                    requestPermissions(missing.toTypedArray(), REQUEST_WEB_PERMISSION)
+                }
+            }
+        }
+
+        override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+            if (customView != null) {
+                callback.onCustomViewHidden()
+                return
+            }
+            customView = view
+            customCallback = callback
+            root.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            web.visibility = View.GONE
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            immersive(true)
+        }
+
+        override fun onHideCustomView() {
+            customView?.let { root.removeView(it) }
+            customView = null
+            customCallback?.onCustomViewHidden()
+            customCallback = null
+            web.visibility = View.VISIBLE
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            immersive(false)
+        }
+
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            Log.d("PiikWeb", "${message.messageLevel()}: ${message.message()}")
+            return true
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_WEB_PERMISSION) return
+        val request = pendingPermission ?: return
+        pendingPermission = null
+        val granted = request.resources.filter { r ->
+            val perm = when (r) {
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+                else -> null
+            }
+            perm == null || checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+        }
+        if (granted.isEmpty()) request.deny() else request.grant(granted.toTypedArray())
+    }
+
+    private fun immersive(on: Boolean) {
+        val c = window.insetsController ?: return
+        if (on) {
+            c.hide(WindowInsets.Type.systemBars())
+            c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            c.show(WindowInsets.Type.systemBars())
+        }
+    }
+
+    // ---- JS bridge (clipboard / share, which WebView doesn't fully provide) ----
+
+    private inner class Bridge {
+        @JavascriptInterface
+        fun copyText(text: String) {
+            runOnUiThread {
+                service<ClipboardManager>().setPrimaryClip(ClipData.newPlainText("Piik", text))
+                if (android.os.Build.VERSION.SDK_INT < 33) Toast.makeText(this@WebActivity, "Copied", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        @JavascriptInterface
+        fun shareText(text: String, title: String?) {
+            runOnUiThread {
+                val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                startActivity(Intent.createChooser(send, title ?: "Share Piik invite"))
+            }
+        }
+
+        @JavascriptInterface
+        fun videoState(playing: Boolean, width: Int, height: Int) {
+            videoPlaying = playing
+            if (width > 0 && height > 0) {
+                val r = width.toFloat() / height
+                // PiP accepts aspect ratios between 1:2.39 and 2.39:1.
+                videoAspect = when {
+                    r > 2.39f -> Rational(239, 100)
+                    r < 1 / 2.39f -> Rational(100, 239)
+                    else -> Rational(width, height)
+                }
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 31) runOnUiThread { updatePip() }
+        }
+    }
+
+    // ---- picture-in-picture for watching ----
+
+    private fun pipParams(): PictureInPictureParams {
+        val b = PictureInPictureParams.Builder().setAspectRatio(videoAspect)
+        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(mode == MODE_WATCH && videoPlaying).setSeamlessResizeEnabled(true)
+        return b.build()
+    }
+
+    private fun updatePip() {
+        try { setPictureInPictureParams(pipParams()) } catch (_: Exception) {}
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (mode == MODE_WATCH && videoPlaying && android.os.Build.VERSION.SDK_INT < 31) {
+            try { enterPictureInPictureMode(pipParams()) } catch (_: Exception) {}
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        web.evaluateJavascript("document.documentElement.classList.toggle('piik-android-pip', $isInPictureInPictureMode)", null)
+    }
+
+    // ---- lifecycle ----
+
+    @Deprecated("Platform back handling without AndroidX")
+    override fun onBackPressed() {
+        when {
+            customView != null -> customCallback?.onCustomViewHidden()
+            web.canGoBack() -> web.goBack()
+            mode == MODE_HOST && HostState.phase == HostState.Phase.RUNNING -> {
+                Toast.makeText(this, "Piik keeps hosting. Stop it from the notification or the Piik home screen.", Toast.LENGTH_LONG).show()
+                @Suppress("DEPRECATION") super.onBackPressed()
+            }
+            else -> @Suppress("DEPRECATION") super.onBackPressed()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        web.saveState(outState)
+    }
+
+    override fun onDestroy() {
+        HostState.removeListener(hostListener)
+        HostState.removeExternalListener(externalListener)
+        web.destroy()
+        super.onDestroy()
+    }
+
+    companion object {
+        const val EXTRA_MODE = "mode"
+        const val EXTRA_URL = "url"
+        const val MODE_WATCH = "watch"
+        const val MODE_HOST = "host"
+        private const val REQUEST_WEB_PERMISSION = 3
+
+        private const val UNLOCK_LOCAL_ADDRESSES = """
+            (function () {
+              if (window.__piikUnlocked || !navigator.mediaDevices) return; window.__piikUnlocked = true;
+              navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(function (s) { s.getTracks().forEach(function (t) { t.stop(); }); })
+                .catch(function () {});
+            })();
+        """
+
+        /**
+         * Small, idempotent page shims: clipboard and Web Share go through the
+         * app; the largest playing <video> is reported for picture-in-picture,
+         * which then shows only that video.
+         */
+        private val POLYFILLS = """
+            (function () {
+              if (window.__piikAndroid) return; window.__piikAndroid = true;
+              var bridge = window.PiikAndroid;
+              try {
+                var clip = navigator.clipboard || {};
+                var orig = clip.writeText && clip.writeText.bind(clip);
+                var writeText = function (t) {
+                  bridge.copyText(String(t));
+                  return orig ? orig(t).catch(function () {}) : Promise.resolve();
+                };
+                if (navigator.clipboard) navigator.clipboard.writeText = writeText;
+                else Object.defineProperty(navigator, 'clipboard', { value: { writeText: writeText } });
+              } catch (e) {}
+              navigator.share = function (d) {
+                d = d || {};
+                bridge.shareText([d.text, d.url].filter(Boolean).join(' '), d.title || null);
+                return Promise.resolve();
+              };
+              navigator.canShare = function () { return true; };
+              var style = document.createElement('style');
+              style.textContent = 'html.piik-android-pip body *{visibility:hidden!important}' +
+                'html.piik-android-pip video.piik-android-main{visibility:visible!important;position:fixed!important;' +
+                'inset:0!important;width:100vw!important;height:100vh!important;object-fit:contain!important;' +
+                'z-index:2147483647!important;background:#000!important}';
+              document.head.appendChild(style);
+              var last = '';
+              setInterval(function () {
+                var best = null, area = 0;
+                document.querySelectorAll('video').forEach(function (v) {
+                  var r = v.getBoundingClientRect(), a = r.width * r.height;
+                  if (!v.paused && v.readyState > 2 && a >= area) { best = v; area = a; }
+                });
+                document.querySelectorAll('video.piik-android-main').forEach(function (v) {
+                  if (v !== best) v.classList.remove('piik-android-main');
+                });
+                if (best) best.classList.add('piik-android-main');
+                var s = best ? ('1,' + best.videoWidth + ',' + best.videoHeight) : '0,0,0';
+                if (s !== last) { last = s; var p = s.split(','); bridge.videoState(p[0] === '1', +p[1], +p[2]); }
+              }, 1000);
+            })();
+        """.trimIndent()
+    }
+}

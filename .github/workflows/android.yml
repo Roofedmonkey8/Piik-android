@@ -1,0 +1,69 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach the APK to tagged releases
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.PIIK_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-35 build-tools;35.0.0"
+
+      - name: Build Piik engine, capture shim and cloudflared
+        run: scripts/build-native.sh
+
+      - name: Release signing key (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.PIIK_KEYSTORE_BASE64 }}
+        if: env.HAS_SIGNING_KEY == 'true'
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "PIIK_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          PIIK_KEYSTORE_PASSWORD: ${{ secrets.PIIK_KEYSTORE_PASSWORD }}
+          PIIK_KEY_ALIAS: ${{ secrets.PIIK_KEY_ALIAS }}
+          PIIK_KEY_PASSWORD: ${{ secrets.PIIK_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Rename
+        run: cp app/build/outputs/apk/release/app-release.apk piik-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: piik-android-apk
+          path: piik-android.apk
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: piik-android.apk

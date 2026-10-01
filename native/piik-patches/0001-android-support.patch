@@ -1,0 +1,131 @@
+diff --git a/cmd/piik-app/dns_android.go b/cmd/piik-app/dns_android.go
+new file mode 100644
+index 0000000..a1eef7d
+--- /dev/null
++++ b/cmd/piik-app/dns_android.go
+@@ -0,0 +1,34 @@
++//go:build android
++
++package main
++
++import (
++	"net"
++	"os"
++	"strings"
++	_ "unsafe" // go:linkname
++)
++
++// Pure-Go binaries on Android have no /etc/resolv.conf, so Go's resolver
++// falls back to 127.0.0.1:53 and every lookup fails (golang/go#10714).
++// The Android app passes the active network's DNS servers in
++// PIIK_DNS_SERVERS; public resolvers remain as a fallback.
++//
++// net.defaultNS is explicitly published for go:linkname (golang/go#67401).
++//
++//go:linkname defaultNS net.defaultNS
++var defaultNS []string
++
++func init() {
++	var servers []string
++	for _, value := range strings.Split(os.Getenv("PIIK_DNS_SERVERS"), ",") {
++		value = strings.TrimSpace(value)
++		if value == "" {
++			continue
++		}
++		if ip := net.ParseIP(value); ip != nil {
++			servers = append(servers, net.JoinHostPort(ip.String(), "53"))
++		}
++	}
++	defaultNS = append(servers, "1.1.1.1:53", "8.8.8.8:53", "[2606:4700:4700::1111]:53")
++}
+diff --git a/internal/app/browser/open.go b/internal/app/browser/open.go
+index 7634c42..f21ebcf 100644
+--- a/internal/app/browser/open.go
++++ b/internal/app/browser/open.go
+@@ -2,12 +2,23 @@ package browser
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"net/url"
++	"os"
+ 	"os/exec"
+ 	"runtime"
+ )
+ 
+ func Open(target string) error {
++	if runtime.GOOS == "android" {
++		// The Android host app reads this line from stderr and opens the page
++		// in its own WebView (local pages) or the system browser (others).
++		if _, _, err := command("linux", target); err != nil {
++			return err
++		}
++		_, err := fmt.Fprintf(os.Stderr, "PIIK_ANDROID_OPEN %s\n", target)
++		return err
++	}
+ 	command, arguments, err := command(runtime.GOOS, target)
+ 	if err != nil {
+ 		return err
+diff --git a/internal/app/lan/addresses.go b/internal/app/lan/addresses.go
+index 7a1e3c0..455102b 100644
+--- a/internal/app/lan/addresses.go
++++ b/internal/app/lan/addresses.go
+@@ -4,6 +4,8 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net"
++	"os"
++	"runtime"
+ 	"sort"
+ 	"strings"
+ )
+@@ -13,9 +15,36 @@ type Address struct {
+ 	Name    string `json:"name"`
+ }
+ 
++// androidAddresses parses "address/interface,..." passed by the Android host
++// app, which can read the active networks that Go itself cannot enumerate.
++func androidAddresses(value string) []Address {
++	var result []Address
++	seen := map[string]bool{}
++	for _, item := range strings.Split(value, ",") {
++		address, name, _ := strings.Cut(strings.TrimSpace(item), "/")
++		ip := net.ParseIP(address)
++		if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsUnspecified() || seen[ip.String()] {
++			continue
++		}
++		if name == "" {
++			name = "android"
++		}
++		seen[ip.String()] = true
++		result = append(result, Address{Address: ip.String(), Name: name})
++	}
++	sort.Slice(result, func(left, right int) bool { return result[left].Address < result[right].Address })
++	return result
++}
++
+ // List describes invitation addresses. It does not choose or constrain the
+ // media interfaces, which remain owned by ICE and the operating system.
+ func List() ([]Address, error) {
++	if runtime.GOOS == "android" {
++		// Android 11+ denies apps the netlink request behind net.Interfaces.
++		if listed := androidAddresses(os.Getenv("PIIK_LAN_ADDRESSES")); len(listed) > 0 {
++			return listed, nil
++		}
++	}
+ 	interfaces, err := net.Interfaces()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("list network interfaces: %w", err)
+diff --git a/internal/app/nativecapture/probe.go b/internal/app/nativecapture/probe.go
+index cc30fcb..22ea89b 100644
+--- a/internal/app/nativecapture/probe.go
++++ b/internal/app/nativecapture/probe.go
+@@ -156,7 +156,7 @@ func decodeProbe(payload []byte) (Capabilities, error) {
+ 	}
+ 	if capabilities.Protocol != probeProtocol ||
+ 		(capabilities.Platform != "windows" && capabilities.Platform != "darwin" &&
+-			capabilities.Platform != "linux") ||
++			capabilities.Platform != "linux" && capabilities.Platform != "android") ||
+ 		len(capabilities.PlatformBuild) == 0 ||
+ 		len(capabilities.PlatformBuild) > maxIdentityBytes ||
+ 		len(capabilities.Adapters) > maxAdapters {
