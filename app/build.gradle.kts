@@ -17,17 +17,16 @@ android {
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
+    // Signs with PIIK_KEYSTORE when provided (stable key: updates install over
+    // each other); otherwise with the auto-generated debug key.
+    val keystore = System.getenv("PIIK_KEYSTORE")
     signingConfigs {
-        // CI and local builds sign with the debug key unless a keystore is provided.
-        create("release") {
-            val store = System.getenv("PIIK_KEYSTORE")
-            if (store != null) {
-                storeFile = file(store)
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
                 storePassword = System.getenv("PIIK_KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("PIIK_KEY_ALIAS")
                 keyPassword = System.getenv("PIIK_KEY_PASSWORD")
-            } else {
-                initWith(getByName("debug"))
             }
         }
     }
@@ -35,7 +34,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = signingConfigs.getByName(if (keystore != null) "release" else "debug")
         }
     }
 
