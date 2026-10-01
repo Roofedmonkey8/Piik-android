@@ -70,6 +70,14 @@ class WebActivity : Activity() {
         web.addJavascriptInterface(Bridge(), "PiikAndroid")
         web.webViewClient = Client()
         web.webChromeClient = Chrome()
+        web.setDownloadListener { url, _, disposition, mime, _ ->
+            val name = android.webkit.URLUtil.guessFileName(url, disposition, mime)
+            when {
+                url.startsWith("blob:") || url.startsWith("data:") ->
+                    web.evaluateJavascript("window.__piikSave && window.__piikSave(${jsonQuote(url)}, ${jsonQuote(name)})", null)
+                else -> openExternal(url)
+            }
+        }
         handle(intent, savedInstanceState)
     }
 
@@ -278,6 +286,16 @@ class WebActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun saveFile(name: String, mime: String, base64: String) {
+            val bytes = runCatching { android.util.Base64.decode(base64, android.util.Base64.DEFAULT) }.getOrNull() ?: return
+            val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "piik-download" }
+            val ok = Diagnostics.saveToDownloads(this@WebActivity, safe, mime, bytes) != null
+            runOnUiThread {
+                Toast.makeText(this@WebActivity, if (ok) "Saved to Downloads/$safe" else "Couldn't save $safe", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        @JavascriptInterface
         fun shareText(text: String, title: String?) {
             runOnUiThread {
                 val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
@@ -352,6 +370,8 @@ class WebActivity : Activity() {
         super.onDestroy()
     }
 
+    private fun jsonQuote(v: String) = org.json.JSONObject.quote(v)
+
     companion object {
         const val EXTRA_MODE = "mode"
         const val EXTRA_URL = "url"
@@ -387,6 +407,30 @@ class WebActivity : Activity() {
                 if (navigator.clipboard) navigator.clipboard.writeText = writeText;
                 else Object.defineProperty(navigator, 'clipboard', { value: { writeText: writeText } });
               } catch (e) {}
+              window.__piikSave = function (href, name) {
+                fetch(href).then(function (r) { return r.blob(); }).then(function (b) {
+                  var fr = new FileReader();
+                  fr.onload = function () {
+                    var data = String(fr.result); var i = data.indexOf(',');
+                    bridge.saveFile(name || 'piik-download', b.type || 'application/octet-stream', data.slice(i + 1));
+                  };
+                  fr.readAsDataURL(b);
+                }).catch(function () {});
+              };
+              document.addEventListener('click', function (e) {
+                var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+                if (!a || !/^(blob|data):/.test(a.href)) return;
+                e.preventDefault();
+                window.__piikSave(a.href, a.getAttribute('download'));
+              }, true);
+              var origClick = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function () {
+                if (this.hasAttribute('download') && /^(blob|data):/.test(this.href)) {
+                  window.__piikSave(this.href, this.getAttribute('download'));
+                  return;
+                }
+                return origClick.call(this);
+              };
               navigator.share = function (d) {
                 d = d || {};
                 bridge.shareText([d.text, d.url].filter(Boolean).join(' '), d.title || null);

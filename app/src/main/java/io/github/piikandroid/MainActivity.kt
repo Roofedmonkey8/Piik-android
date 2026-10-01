@@ -154,6 +154,20 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun saveDebugLog() {
+        android.widget.Toast.makeText(this, "Collecting log…", android.widget.Toast.LENGTH_SHORT).show()
+        Thread {
+            val name = runCatching { Diagnostics.saveDebugLog(this) }.getOrNull()
+            runOnUiThread {
+                android.widget.Toast.makeText(
+                    this,
+                    if (name != null) "Saved to Downloads/$name" else "Couldn't save the log",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }
+        }.start()
+    }
+
     // ---- UI ----
 
     private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
@@ -234,6 +248,8 @@ class MainActivity : Activity() {
         hostStop = button("Stop hosting", false) { PiikService.stop(this) }
         host.addView(gap(8))
         host.addView(hostStop, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+        host.addView(gap(8))
+        host.addView(button("Save debug log", false) { saveDebugLog() }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
         column.addView(host)
         column.addView(gap(22))
 

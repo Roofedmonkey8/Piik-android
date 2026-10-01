@@ -80,6 +80,7 @@ class PiikService : Service() {
                 engine.path,
                 "--capture-process", shim.path,
                 "--config", File(piikDir, "client.json").path,
+                "--debug", "--log-dir", Diagnostics.logDir(this@PiikService).path,
             )
             val tunnel = File(lib, "libcloudflared.so")
             if (tunnel.exists()) args += listOf("--tunnel-process", tunnel.path)
