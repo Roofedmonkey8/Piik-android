@@ -1,3 +1,21 @@
+diff --git a/cmd/piik-app/anet_android.go b/cmd/piik-app/anet_android.go
+new file mode 100644
+index 0000000..24dcacd
+--- /dev/null
++++ b/cmd/piik-app/anet_android.go
+@@ -0,0 +1,12 @@
++//go:build android
++
++package main
++
++import "github.com/wlynxg/anet"
++
++// Pion lists network interfaces through anet. In a pure-Go (no cgo) build anet
++// can't detect the Android version and falls back to net.Interfaces, which
++// Android 11+ denies to apps ("netlinkrib: permission denied"). Its Android
++// 11 path uses only RTM_GETADDR, which works on every supported version
++// (Android 10+).
++func init() { anet.SetAndroidVersion(11) }
 diff --git a/cmd/piik-app/dns_android.go b/cmd/piik-app/dns_android.go
 new file mode 100644
 index 0000000..a1eef7d
