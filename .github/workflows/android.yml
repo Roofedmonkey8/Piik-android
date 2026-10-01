@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: "24"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -52,7 +52,17 @@ jobs:
           PIIK_KEYSTORE_PASSWORD: ${{ secrets.PIIK_KEYSTORE_PASSWORD }}
           PIIK_KEY_ALIAS: ${{ secrets.PIIK_KEY_ALIAS }}
           PIIK_KEY_PASSWORD: ${{ secrets.PIIK_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon assembleRelease
+        run: |
+          set +e
+          ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee gradle.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" != 0 ]; then
+            # Surface the real errors as annotations (visible without opening raw logs).
+            grep -E "^e: |error:|What went wrong|^> |Caused by|FAILED|Exception" gradle.log | grep -v "^> Task" | head -30 | while IFS= read -r line; do
+              echo "::error::${line:0:900}"
+            done
+          fi
+          exit $status
 
       - name: Rename
         run: cp app/build/outputs/apk/release/app-release.apk piik-android.apk
